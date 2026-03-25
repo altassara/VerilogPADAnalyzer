@@ -22,7 +22,9 @@ class Synthesis:
         self._delay = None
 
         self._config_path = self.get_config_path()
-        self._lib_path = f'{self._config_path}/gscl45nm.lib'
+        #self._lib_path = f'{self._config_path}/gscl45nm.lib'
+        self._lib_path = f'syn_lib/nangate_45nm_typ.lib'
+        self._verilog_lib_path = f'syn_lib/cells.v'
         self._abc_script_path = f'{self._config_path}/abc.script'
 
 
@@ -63,22 +65,37 @@ class Synthesis:
             self._area = float(area)
         return float(area)
 
-    def get_power(self):
+    def get_power(self, input_vectors_file=None):
         """
         measures the power with opensta synthesis tool with the tech. library specified
-        :return: a float number representing the power
+        If input_vectors_file is provided (path to a file containing input vectors), runs a VCD simulation first.
         """
         self.__synthesize()
 
-        sta_command = f"read_liberty {self._lib_path}\n" \
-                      f"read_verilog {self._syn_path}\n" \
-                      f"link_design {self._module_name}\n" \
-                      f"create_clock -name clk -period 1\n" \
-                      f"set_input_delay -clock clk 0 [all_inputs]\n" \
-                      f"set_output_delay -clock clk 0 [all_outputs]\n" \
-                      f"report_checks\n" \
-                      f"report_power -digits 12\n" \
-                      f"exit"
+        cmds = []
+        cmds.append(f"read_liberty {self._lib_path}")
+        cmds.append(f"read_verilog {self._syn_path}")
+        cmds.append(f"link_design {self._module_name}")
+        cmds.append(f"create_clock -name clk -period 1")
+        
+        # Gestione VCD Simulation
+        if input_vectors_file:
+            vcd_file = self.__run_vcd_simulation(input_vectors_file)
+            if vcd_file and os.path.exists(vcd_file):
+                cmds.append(f"read_vcd {vcd_file} -scope tb_{self._module_name}/uut")
+            else:
+                print("Warning: VCD simulation failed, falling back to default activity.")
+                cmds.append(f"set_input_delay -clock clk 0 [all_inputs]")
+                cmds.append(f"set_output_delay -clock clk 0 [all_outputs]")
+        else:
+             cmds.append(f"set_input_delay -clock clk 0 [all_inputs]")
+             cmds.append(f"set_output_delay -clock clk 0 [all_outputs]")
+        
+        cmds.append("report_checks")
+        cmds.append("report_power -digits 12")
+        cmds.append("exit")
+        
+        sta_command = "\n".join(cmds) + "\n"
 
         with open(self._power_script, 'w') as ds:
             ds.writelines(sta_command)
@@ -88,6 +105,9 @@ class Synthesis:
         if process.stderr:
             raise Exception(f'OpenSTA ERROR!!!\n {process.stderr.decode()}')
         else:
+            if input_vectors_file and os.path.exists(vcd_file):
+                os.remove(vcd_file)
+            
             os.remove(self._power_script)
             pattern = r"Total\s+(\d+.\d+)[^0-9]*\d+\s+(\d+.\d+)[^0-9]*\d+\s+(\d+.\d+)[^0-9]*\d+\s+(\d+.\d+[^0-9]*\d+)\s+"
             if re.search(pattern, process.stdout.decode()):
@@ -117,6 +137,144 @@ class Synthesis:
                     a.write(f'{float(0)}\n')
                 self._power = float(0)
                 return 0
+
+
+    def __extract_ports(self):
+        """
+        Parses the synthesized Verilog file to find extracted ports.
+        Returns two lists: inputs and outputs.
+        Handles both 'input \A[0] ;' and 'input in0;' formats.
+        """
+        inputs = []
+        outputs = []
+        
+        with open(self._syn_path, 'r') as f:
+            content = f.read()
+            
+        # Regex per trovare dichiarazioni input/output
+        # Cerca: "input " seguito da nome porta (che potrebbe avere backslash o parentesi) e punto e virgola
+        input_matches = re.findall(r'input\s+([^;]+);', content)
+        output_matches = re.findall(r'output\s+([^;]+);', content)
+        
+        # Pulizia dei nomi (rimuove spazi e newlines extra)
+        for i_grp in input_matches:
+            # Potrebbero esserci più porte sulla stessa riga separate da virgola (raro in yosys synth -flatten ma possibile)
+            ports = [p.strip() for p in i_grp.split(',')]
+            inputs.extend(ports)
+            
+        for o_grp in output_matches:
+            ports = [p.strip() for p in o_grp.split(',')]
+            outputs.extend(ports)
+            
+        return inputs, outputs
+
+    def __run_vcd_simulation(self, input_vectors):
+        """
+        Generates a testbench, runs iverilog simulation, and returns path to VCD file.
+        input_vectors: Path to file only.
+                       Each string represents the full concave of A and B bits.
+                       Assumes MSB is first char in string.
+        """
+        inputs, outputs = self.__extract_ports()
+        
+        def natural_sort_key(s):
+            return [int(text) if text.isdigit() else text.lower()
+                    for text in re.split('([0-9]+)', s)]
+        
+        inputs.sort(key=natural_sort_key)
+        
+        num_inputs = len(inputs)
+        
+        tb_file = f'{self._temp_dir}/tb_{self._module_name}.v'
+        vcd_file = f'{self._temp_dir}/{self._module_name}.vcd'
+        
+        num_vectors = 0
+        if isinstance(input_vectors, str) and os.path.exists(input_vectors):
+            input_data_file = os.path.abspath(input_vectors)
+            with open(input_data_file, 'r') as f:
+                num_vectors = sum(1 for line in f if line.strip())
+        else:
+            raise Exception("Input vectors must be a valid file path.")
+        
+
+        with open(tb_file, 'w') as tb:
+            tb.write(f"`timescale 1ns/1ps\n")
+            tb.write(f"module tb_{self._module_name};\n")
+            
+            # Dichiarazione Reg/Wire
+            for p in inputs:
+                p_fmt = f"{p} " if p.startswith('\\') else p
+                tb.write(f"  reg {p_fmt};\n")
+            for p in outputs:
+                p_fmt = f"{p} " if p.startswith('\\') else p
+                tb.write(f"  wire {p_fmt};\n")
+            
+            tb.write("  reg clk;\n")
+            
+            # Memoria per vettori
+            tb.write(f"  reg [{num_inputs}-1:0] test_vectors [0:{num_vectors-1}];\n")
+            tb.write("  integer i;\n")
+            
+            # Istanza UUT
+            tb.write(f"  {self._module_name} uut (\n")
+            connections = []
+            for p in inputs + outputs:
+                p_fmt = f"{p} " if p.startswith('\\') else p
+                connections.append(f"    .{p_fmt}({p_fmt})")
+            tb.write(",\n".join(connections))
+            tb.write("\n  );\n")
+            
+            # Clock Generation
+            tb.write("  initial begin\n    clk = 0;\n    forever #1 clk = ~clk;\n  end\n")
+            
+            # Stimulus Process
+            tb.write("  initial begin\n")
+            tb.write(f"    $readmemb(\"{input_data_file}\", test_vectors);\n")
+            tb.write(f"    $dumpfile(\"{vcd_file}\");\n")
+            tb.write(f"    $dumpvars(0, tb_{self._module_name});\n")
+            
+            tb.write(f"    for (i=0; i<{num_vectors}; i=i+1) begin\n")
+            tb.write("      @(negedge clk);\n")
+            
+            # Il bit più a sinistra (index N-1) è l'ultimo input nel sort (B[7]).
+            # Il bit più a destra (index 0) è il primo input nel sort (A[0]).
+            
+            concat_list = list(inputs)
+            if concat_list:
+                # Format each port in the concatenation list
+                fmt_concat = [f"{p} " if p.startswith('\\') else p for p in concat_list]
+                tb.write(f"      {{ {', '.join(fmt_concat)} }} = test_vectors[i];\n")
+            
+            tb.write("    end\n")
+            tb.write("    @(negedge clk);\n")
+            tb.write("    $finish;\n")
+            tb.write("  end\n")
+            tb.write("endmodule\n")
+
+        sim_out = f'{self._temp_dir}/sim_{self._module_name}.out'
+        lib_verilog = self._verilog_lib_path
+        
+        try:
+            cmd_compile = ['iverilog', '-o', sim_out, tb_file, self._syn_path, lib_verilog]
+            subprocess.run(cmd_compile, check=True, stdout=PIPE, stderr=PIPE)
+            
+            cmd_run = ['vvp', sim_out]
+            subprocess.run(cmd_run, check=True, stdout=PIPE, stderr=PIPE)
+        except subprocess.CalledProcessError as e:
+            error_msg = f"Error running command: {e.cmd}\nReturn code: {e.returncode}\n"
+            if e.stdout:
+                error_msg += f"Stdout:\n{e.stdout.decode()}\n"
+            if e.stderr:
+                error_msg += f"Stderr:\n{e.stderr.decode()}\n"
+            raise Exception(error_msg)
+        
+        # Cleanup
+        #if os.path.exists(sim_out): os.remove(sim_out)
+        #if os.path.exists(tb_file): os.remove(tb_file)
+        # if os.path.exists(input_data_file): os.remove(input_data_file)
+        
+        return vcd_file
+
 
 
     def get_delay(self):
@@ -209,13 +367,13 @@ class Synthesis:
         synth_obj._area = synth_obj.get_area()
         return synth_obj._area
     @classmethod
-    def power(cls, input_path: str, temp_dir: str = None, report_dir: str = None):
+    def power(cls, input_path: str, temp_dir: str = None, report_dir: str = None, input_vectors_file: str = None):
         """
         measures the power with opensta synthesis tool with the tech. library specified
         :return: a float number representing the power
         """
         synth_obj = Synthesis(input_path, temp_dir, report_dir)
-        synth_obj._power = synth_obj.get_power()
+        synth_obj._power = synth_obj.get_power(input_vectors_file)
         return synth_obj._power
 
     @classmethod
