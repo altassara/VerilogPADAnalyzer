@@ -102,6 +102,13 @@ class Synthesis:
         # process = subprocess.run([sxpatconfig.OPENSTA, power_script], stderr=PIPE)
 
         process = subprocess.run([OPENSTA, self._power_script], stdout=PIPE, stderr=PIPE)
+
+        with open(f'{self._rep_dir}/{self._module_name}_opensta_debug.log', 'w') as log:
+            log.write(f"CMD: {OPENSTA} {self._power_script}\n")
+            if process.stdout: log.write(process.stdout.decode())
+            if process.stderr: log.write("\nSTDERR:\n" + process.stderr.decode())
+
+
         if process.stderr:
             raise Exception(f'OpenSTA ERROR!!!\n {process.stderr.decode()}')
         else:
@@ -139,33 +146,97 @@ class Synthesis:
                 return 0
 
 
+    def __format_identifier(self, name: str) -> str:
+        """Formats identifiers, adding terminating space for escaped Verilog names."""
+        return f"{name} " if name.startswith('\\') else name
+
+    def __natural_sort_key(self, s: str):
+        return [int(text) if text.isdigit() else text.lower()
+                for text in re.split('([0-9]+)', s)]
+
+    def __canonical_stimulus_inputs(self, inputs):
+        """
+        Builds canonical bit-level stimulus ordering for input concatenation.
+        Output order is group-wise (natural sort by signal base) and MSB->LSB inside each group.
+        This keeps bitstream interpretation consistent across vector and scalarized netlists.
+        """
+        grouped = {}
+        scalar_names = []
+
+        for p in inputs:
+            decl = p['decl']
+            name = p['name']
+
+            # Vector declaration, e.g. "[7:0] a" -> a[7],...,a[0]
+            width_match = re.match(r'^\[(\d+)\s*:\s*(\d+)\]\s+(.+)$', decl)
+            if width_match and '[' not in name:
+                msb = int(width_match.group(1))
+                lsb = int(width_match.group(2))
+                base = width_match.group(3).strip()
+                step = -1 if msb >= lsb else 1
+                indices = range(msb, lsb + step, step)
+                grouped.setdefault(base, [])
+                for idx in indices:
+                    grouped[base].append((idx, f"{base}[{idx}]"))
+                continue
+
+            # Scalarized indexed port, e.g. "\\A[3]" or "A[3]"
+            idx_match = re.match(r'^(\\?[^\[]+)\[(\d+)\]$', name)
+            if idx_match:
+                base = idx_match.group(1)
+                idx = int(idx_match.group(2))
+                grouped.setdefault(base, []).append((idx, name))
+            else:
+                scalar_names.append(name)
+
+        ordered = []
+        for base in sorted(grouped.keys(), key=self.__natural_sort_key):
+            # Canonical bit ordering is MSB->LSB.
+            for _, expr in sorted(grouped[base], key=lambda x: x[0], reverse=True):
+                ordered.append(expr)
+
+        ordered.extend(sorted(scalar_names, key=self.__natural_sort_key))
+        return ordered
+
     def __extract_ports(self):
         """
-        Parses the synthesized Verilog file to find extracted ports.
-        Returns two lists: inputs and outputs.
-        Handles both 'input \A[0] ;' and 'input in0;' formats.
+        Parses synthesized Verilog declarations and extracts ports.
+        Returns two lists of dictionaries: {'decl': <decl_text>, 'name': <signal_name>}.
         """
         inputs = []
         outputs = []
-        
+
         with open(self._syn_path, 'r') as f:
             content = f.read()
-            
-        # Regex per trovare dichiarazioni input/output
-        # Cerca: "input " seguito da nome porta (che potrebbe avere backslash o parentesi) e punto e virgola
-        input_matches = re.findall(r'input\s+([^;]+);', content)
-        output_matches = re.findall(r'output\s+([^;]+);', content)
-        
-        # Pulizia dei nomi (rimuove spazi e newlines extra)
-        for i_grp in input_matches:
-            # Potrebbero esserci più porte sulla stessa riga separate da virgola (raro in yosys synth -flatten ma possibile)
-            ports = [p.strip() for p in i_grp.split(',')]
-            inputs.extend(ports)
-            
-        for o_grp in output_matches:
-            ports = [p.strip() for p in o_grp.split(',')]
-            outputs.extend(ports)
-            
+
+        for raw_line in content.splitlines():
+            line = raw_line.split('//', 1)[0].strip()
+            if not line:
+                continue
+
+            match = re.match(r'^(input|output)\s+(.+);$', line)
+            if not match:
+                continue
+
+            direction = match.group(1)
+            body = match.group(2).strip()
+            body = re.sub(r'^(wire|reg)\s+', '', body)
+
+            width = ''
+            width_match = re.match(r'^(\[[^\]]+\])\s+(.*)$', body)
+            if width_match:
+                width = width_match.group(1)
+                body = width_match.group(2).strip()
+
+            names = [p.strip() for p in body.split(',') if p.strip()]
+            for name in names:
+                decl = f"{width} {name}".strip() if width else name
+                entry = {'decl': decl, 'name': name}
+                if direction == 'input':
+                    inputs.append(entry)
+                else:
+                    outputs.append(entry)
+
         return inputs, outputs
 
     def __run_vcd_simulation(self, input_vectors):
@@ -176,18 +247,15 @@ class Synthesis:
                        Assumes MSB is first char in string.
         """
         inputs, outputs = self.__extract_ports()
-        
-        def natural_sort_key(s):
-            return [int(text) if text.isdigit() else text.lower()
-                    for text in re.split('([0-9]+)', s)]
-        
-        inputs.sort(key=natural_sort_key)
-        
-        num_inputs = len(inputs)
-        
+
+        inputs.sort(key=lambda p: self.__natural_sort_key(p['name']))
+        stim_inputs = self.__canonical_stimulus_inputs(inputs)
+
+        num_inputs = len(stim_inputs)
+
         tb_file = f'{self._temp_dir}/tb_{self._module_name}.v'
         vcd_file = f'{self._temp_dir}/{self._module_name}.vcd'
-        
+
         num_vectors = 0
         if isinstance(input_vectors, str) and os.path.exists(input_vectors):
             input_data_file = os.path.abspath(input_vectors)
@@ -195,56 +263,53 @@ class Synthesis:
                 num_vectors = sum(1 for line in f if line.strip())
         else:
             raise Exception("Input vectors must be a valid file path.")
-        
 
         with open(tb_file, 'w') as tb:
             tb.write(f"`timescale 1ns/1ps\n")
             tb.write(f"module tb_{self._module_name};\n")
-            
+
             # Dichiarazione Reg/Wire
             for p in inputs:
-                p_fmt = f"{p} " if p.startswith('\\') else p
-                tb.write(f"  reg {p_fmt};\n")
+                tb.write(f"  reg {self.__format_identifier(p['decl'])};\n")
             for p in outputs:
-                p_fmt = f"{p} " if p.startswith('\\') else p
-                tb.write(f"  wire {p_fmt};\n")
-            
+                tb.write(f"  wire {self.__format_identifier(p['decl'])};\n")
+
             tb.write("  reg clk;\n")
-            
+
             # Memoria per vettori
             tb.write(f"  reg [{num_inputs}-1:0] test_vectors [0:{num_vectors-1}];\n")
             tb.write("  integer i;\n")
-            
+
             # Istanza UUT
             tb.write(f"  {self._module_name} uut (\n")
             connections = []
             for p in inputs + outputs:
-                p_fmt = f"{p} " if p.startswith('\\') else p
-                connections.append(f"    .{p_fmt}({p_fmt})")
+                port = self.__format_identifier(p['name'])
+                sig = self.__format_identifier(p['name'])
+                connections.append(f"    .{port}({sig})")
             tb.write(",\n".join(connections))
             tb.write("\n  );\n")
-            
+
             # Clock Generation
             tb.write("  initial begin\n    clk = 0;\n    forever #1 clk = ~clk;\n  end\n")
-            
+
             # Stimulus Process
             tb.write("  initial begin\n")
             tb.write(f"    $readmemb(\"{input_data_file}\", test_vectors);\n")
             tb.write(f"    $dumpfile(\"{vcd_file}\");\n")
             tb.write(f"    $dumpvars(0, tb_{self._module_name});\n")
-            
+
             tb.write(f"    for (i=0; i<{num_vectors}; i=i+1) begin\n")
             tb.write("      @(negedge clk);\n")
-            
-            # Il bit più a sinistra (index N-1) è l'ultimo input nel sort (B[7]).
-            # Il bit più a destra (index 0) è il primo input nel sort (A[0]).
-            
-            concat_list = list(inputs)
+
+            # Input vector mapping is canonicalized bit-wise:
+            # test_vectors[i][N-1] -> first element in concat_list,
+            # test_vectors[i][0]   -> last element in concat_list.
+            # Each indexed signal group is ordered MSB->LSB.
+            concat_list = [self.__format_identifier(sig) for sig in stim_inputs]
             if concat_list:
-                # Format each port in the concatenation list
-                fmt_concat = [f"{p} " if p.startswith('\\') else p for p in concat_list]
-                tb.write(f"      {{ {', '.join(fmt_concat)} }} = test_vectors[i];\n")
-            
+                tb.write(f"      {{ {', '.join(concat_list)} }} = test_vectors[i];\n")
+
             tb.write("    end\n")
             tb.write("    @(negedge clk);\n")
             tb.write("    $finish;\n")
@@ -253,11 +318,11 @@ class Synthesis:
 
         sim_out = f'{self._temp_dir}/sim_{self._module_name}.out'
         lib_verilog = self._verilog_lib_path
-        
+
         try:
             cmd_compile = ['iverilog', '-o', sim_out, tb_file, self._syn_path, lib_verilog]
             subprocess.run(cmd_compile, check=True, stdout=PIPE, stderr=PIPE)
-            
+
             cmd_run = ['vvp', sim_out]
             subprocess.run(cmd_run, check=True, stdout=PIPE, stderr=PIPE)
         except subprocess.CalledProcessError as e:
@@ -267,12 +332,12 @@ class Synthesis:
             if e.stderr:
                 error_msg += f"Stderr:\n{e.stderr.decode()}\n"
             raise Exception(error_msg)
-        
+
         # Cleanup
         #if os.path.exists(sim_out): os.remove(sim_out)
         #if os.path.exists(tb_file): os.remove(tb_file)
         # if os.path.exists(input_data_file): os.remove(input_data_file)
-        
+
         return vcd_file
 
 
