@@ -13,7 +13,7 @@ class Synthesis:
         self._rep_dir = f'{report_dir}' if report_dir else 'report'
         os.makedirs(self._temp_dir, exist_ok=True)
         os.makedirs(self._rep_dir, exist_ok=True)
-        self._syn_path = f'{self._temp_dir}/{self._module_name}_syn.v'
+        self._syn_path = f'{self._temp_dir}/syn.v'
         self._power_script = f'{self._temp_dir}/{self._module_name}_power.script'
         self._delay_script = f'{self._temp_dir}/{self._module_name}_delay.script'
 
@@ -195,6 +195,21 @@ class Synthesis:
             for _, expr in sorted(grouped[base], key=lambda x: x[0], reverse=True):
                 ordered.append(expr)
 
+        # Flat scalar ports like in0..in15 are treated as two packed halves.
+        # This preserves the existing test-vector convention used by the generated multiplier TBs.
+        scalar_match = [re.match(r'^(.*?)(\d+)$', name) for name in scalar_names]
+        if scalar_names and all(scalar_match) and len({m.group(1) for m in scalar_match}) == 1:
+            prefix = scalar_match[0].group(1)
+            indices = sorted(int(m.group(2)) for m in scalar_match)
+            expected = list(range(len(indices)))
+            if indices == expected and len(indices) % 2 == 0 and len(indices) > 1:
+                half = len(indices) // 2
+                for idx in range(half - 1, -1, -1):
+                    ordered.append(f"{prefix}{idx}")
+                for idx in range(len(indices) - 1, half - 1, -1):
+                    ordered.append(f"{prefix}{idx}")
+                return ordered
+
         ordered.extend(sorted(scalar_names, key=self.__natural_sort_key))
         return ordered
 
@@ -253,8 +268,8 @@ class Synthesis:
 
         num_inputs = len(stim_inputs)
 
-        tb_file = f'{self._temp_dir}/tb_{self._module_name}.v'
-        vcd_file = f'{self._temp_dir}/{self._module_name}.vcd'
+        tb_file = f'{self._temp_dir}/tb.v'
+        vcd_file = f'{self._temp_dir}/vcd.vcd'
 
         num_vectors = 0
         if isinstance(input_vectors, str) and os.path.exists(input_vectors):
@@ -316,7 +331,7 @@ class Synthesis:
             tb.write("  end\n")
             tb.write("endmodule\n")
 
-        sim_out = f'{self._temp_dir}/sim_{self._module_name}.out'
+        sim_out = f'{self._temp_dir}/sim.out'
         lib_verilog = self._verilog_lib_path
 
         try:
