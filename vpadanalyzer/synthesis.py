@@ -357,41 +357,90 @@ class Synthesis:
 
 
 
-    def get_delay(self):
+    # def get_delay(self):
+    #     """
+    #     measures the delay with opensta synthesis tool with the tech. library specified
+    #     :return: a float number representing the delay
+    #     """
+    #     self.__synthesize()
+
+    #     sta_command = f"read_liberty {self._lib_path}\n" \
+    #                   f"read_verilog {self._syn_path}\n" \
+    #                   f"link_design {self._module_name}\n" \
+    #                   f"create_clock -name clk -period 1\n" \
+    #                   f"set_input_delay -clock clk 0 [all_inputs]\n" \
+    #                   f"set_output_delay -clock clk 0 [all_outputs]\n" \
+    #                   f"report_checks -digits 6\n" \
+    #                   f"exit"
+    #     with open(self._delay_script, 'w') as ds:
+    #         ds.writelines(sta_command)
+    #     # process = subprocess.run([sxpatconfig.OPENSTA, delay_script], stderr=PIPE)
+    #     process = subprocess.run([OPENSTA, self._delay_script], stdout=PIPE, stderr=PIPE)
+    #     if process.stderr:
+    #         raise Exception(f'Yosys ERROR!!!\n {process.stderr.decode()}')
+    #     else:
+    #         os.remove(self._delay_script)
+    #         if re.search('(\d+.\d+).*data arrival time', process.stdout.decode()):
+    #             time = re.search('(\d+.\d+).*data arrival time', process.stdout.decode()).group(1)
+    #             with open(f'{self._rep_dir}/{self._module_name}.delay', 'w') as a:
+    #                 a.write(f'{float(time)}\n')
+    #             self._delay = float(time)
+    #             return float(time)
+    #         else:
+    #             print('OpenSTA Warning! Design has 0 delay!')
+    #             with open(f'{self._rep_dir}/{self._module_name}.delay', 'w') as a:
+    #                 a.write(f'{float(0)}\n')
+    #             self._delay = float(0)
+    #             return 0
+            
+    def get_delay(self) -> float:
         """
-        measures the delay with opensta synthesis tool with the tech. library specified
+        Measures the delay using ABC mapping log within Yosys,
         :return: a float number representing the delay
         """
-        self.__synthesize()
+        
+        temp_abc_script = f"{self._rep_dir}/temp_run.abc"
+        
+        try:
+            with open(self._abc_script_path, 'r') as f_in:
+                original_commands = f_in.read()
+                
+            with open(temp_abc_script, 'w') as f_out:
+                f_out.write(original_commands)
+                f_out.write("\nprint_stats\n")
+        except Exception as e:
+            raise Exception(f"Errore nella lettura/scrittura dello script ABC: {e}")
 
-        sta_command = f"read_liberty {self._lib_path}\n" \
-                      f"read_verilog {self._syn_path}\n" \
-                      f"link_design {self._module_name}\n" \
-                      f"create_clock -name clk -period 1\n" \
-                      f"set_input_delay -clock clk 0 [all_inputs]\n" \
-                      f"set_output_delay -clock clk 0 [all_outputs]\n" \
-                      f"report_checks -digits 6\n" \
-                      f"exit"
-        with open(self._delay_script, 'w') as ds:
-            ds.writelines(sta_command)
-        # process = subprocess.run([sxpatconfig.OPENSTA, delay_script], stderr=PIPE)
-        process = subprocess.run([OPENSTA, self._delay_script], stdout=PIPE, stderr=PIPE)
-        if process.stderr:
+        yosys_command = f"read_verilog \"{self._input_path}\";\n" \
+                        f"synth -flatten;\n" \
+                        f"opt;\n" \
+                        f"opt_clean -purge;\n" \
+                        f"abc -liberty {self._lib_path} -script {temp_abc_script};\n"
+
+        process = subprocess.run([YOSYS, '-p', yosys_command], stdout=PIPE, stderr=PIPE)
+        
+        if os.path.exists(temp_abc_script):
+            os.remove(temp_abc_script)
+
+        if process.stderr and b'ERROR' in process.stderr:
             raise Exception(f'Yosys ERROR!!!\n {process.stderr.decode()}')
+
+        stdout = process.stdout.decode()
+        delay = 0.0
+
+
+        delay_match = re.search(r'(?i)delay\s*[:=]\s*(\d+\.\d+)', stdout)
+        
+        if delay_match:
+            delay = float(delay_match.group(1))*10**-3
         else:
-            os.remove(self._delay_script)
-            if re.search('(\d+.\d+).*data arrival time', process.stdout.decode()):
-                time = re.search('(\d+.\d+).*data arrival time', process.stdout.decode()).group(1)
-                with open(f'{self._rep_dir}/{self._module_name}.delay', 'w') as a:
-                    a.write(f'{float(time)}\n')
-                self._delay = float(time)
-                return float(time)
-            else:
-                print('OpenSTA Warning! Design has 0 delay!')
-                with open(f'{self._rep_dir}/{self._module_name}.delay', 'w') as a:
-                    a.write(f'{float(0)}\n')
-                self._delay = float(0)
-                return 0
+            print("ABC Warning: Delay non trovato nel log. Impostato a 0.")
+
+        with open(f'{self._rep_dir}/{self._module_name}.delay', 'w') as f_delay:
+            f_delay.write(f'{delay}\n')
+            
+        self._delay = delay
+        return delay
 
 
     def __synthesize(self):
